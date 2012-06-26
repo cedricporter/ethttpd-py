@@ -11,3 +11,8 @@ a.html
 *.swp
 *.swo
 *~
+wordpress/
+aaa.txt
+cgi.py
+phpinfo.php
+test.php
