@@ -1,0 +1,13 @@
+.ropeproject/config.py
+.ropeproject/globalnames
+.ropeproject/history
+.ropeproject/objectdb
+*.jpg
+EverET.org_files/
+*.pyc
+EverET.org.html
+index.html
+a.html
+*.swp
+*.swo
+*~

@@ -4,18 +4,256 @@
 # website: http://EverET.org
 #
 
-import socket
+# Rule Of Optimization: Prototype before polishing. Get it
+#                       working before you optimize it.
+
+import socket, os, threading, sys, signal, stat
+import time, struct, re, traceback
+import pprint, ettools
 
 host = ''
 port = 12345
+timeout = 5
 
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind((host, port))
-s.listen(5)
+HTTP_PROTOCOL = 'HTTP/1.1'
 
-while True:
-    clientfd, clientaddr = s.accept()
-    clientfd.send('HTTP/1.0 200 OK\r\nContent-type: text/html\r\n\r\n<h1>Hello, ET</h1>')
-    clientfd.close()
+mimes = {"application/ogg":      " ogg",
+         "application/pdf":      " pdf",
+         "application/xml":      " xsl xml",
+         "application/xml-dtd":  " dtd",
+         "application/xslt+xml": " xslt",
+         "application/zip":      " zip",
+         "audio/mpeg":           " mp2 mp3 mpga",
+         "image/gif":            " gif",
+         "image/jpeg":           " jpeg jpe jpg",
+         "image/png":            " png",
+         "text/css":             " css",
+         "text/html":            " html htm",
+         "text/javascript":      " js",
+         "text/plain":           " txt asc",
+         "video/mpeg":           " mpeg mpe mpg",
+         "video/quicktime":      " qt mov",
+         "video/x-msvideo":      " avi",}
 
+# refine mimes for better use
+mm = {}
+for t in mimes.keys():
+    for ext in mimes[t].split():
+        mm[ext] = t
+mimes = mm 
+
+def get_mime(ext):
+    'Get mime type by extension, ignore case'
+    return mimes.get(ext.lower(), 'application/octet-stream')
+
+class State:
+    REPLY_FROM_FILE = 0
+    REPLY_DIRECT = 1
+
+class Connection(object):
+    #@ettools.printargs
+    def __init__(self, sockfd, remote_ip):
+        self.sockfd = sockfd
+        self.remote_ip = remote_ip
+        self.request = None
+        self.state = None
+        self.http_code = -1
+        self.http_msg = ''
+        self.headers = {}
+        self.reply_fd = None
+        self.reply_html = ''
+        self.keepalive = False
+
+class Request(object):
+    def __init__(self):
+        self.method = None
+        self.uri = None
+        self.attrs = None
+        self.body = None
+
+def init(): 
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, port))
+    s.listen(5) 
+    return s
+
+def parse_http(conn, req_text):
+    try:
+        reqlines = req_text.splitlines()
+        reqline = reqlines[0]
+        method, uri, protocol = reqline.split() 
+        attrs = {}
+        for i in range(1, len(reqlines)):
+            colonindex = reqlines[i].find(':')
+            if colonindex == -1:
+                continue
+            key = reqlines[i][:colonindex]
+            value = reqlines[i][colonindex + 2:] # strip ": "
+            attrs[key] = value 
+        if uri.startswith('/'):
+            uri = uri[1:]
+
+        if uri == '':
+            uri = 'index.html'
+
+        conn.method = method
+        conn.uri = uri
+        conn.attrs = attrs
+
+        conn.keepalive = True if attrs.get('Connection', '').lower() == 'keep-alive'\
+            else False
+        if conn.keepalive:
+            conn.headers['Connection'] = 'Keep-Alive' 
+            conn.headers['Keep-Alive'] = 'timeout=%d' % (timeout, )
+    except Exception, e:
+        traceback.print_exc()
+        return -1
+
+    return 0
+
+common_response = {
+    '404': 'HTTP/1.1 404 Not Found\r\n',
+    }
+
+def handle_cgi(conn):
+    read_end, write_end = os.pipe()
+    try:
+        pid = os.fork()
+    except:
+        return
+    if pid == 0: # child
+        os.dup2(write_end, sys.stdout.fileno())
+        
+        'exec'
+    else: # parent
+        pass
+
+
+def make_direct_reply(conn, code, msg, html):
+    conn.state = State.REPLY_DIRECT
+    conn.reply_html = html
+    conn.http_code = code
+    conn.http_msg = msg
+    conn.headers['Content-Type'] = 'text/html'
+    conn.headers['Content-Length'] = str(len(html))
+
+def handle_get(conn):
+    '''handle GET method'''
+    print 'uri:', conn.uri
+
+    # static ?
+
+    # not a file, 404
+    if not os.path.isfile(conn.uri):
+        make_direct_reply(conn, 404, 'Not Found',
+                          '404 Not Found You Wanted')
+        return
+
+    # privilege
+    try:
+        f = open(conn.uri, 'rb')
+    except IOError, e:
+        make_direct_reply(conn, 403, 'Forbidden',
+                          'Permision Denied')
+        return
+
+    file_status = os.stat(conn.uri) 
+    file_size = file_status[stat.ST_SIZE]
+    modified_date = file_status[stat.ST_MTIME]
+
+    ext = os.path.splitext(conn.uri)[1]
+    ext = ext[1:] if ext.startswith('.') else ext
+
+    # OK
+    conn.state = State.REPLY_FROM_FILE
+    conn.http_code = 200
+    conn.http_msg = 'OK' 
+    conn.reply_fd = f
+    conn.headers['Content-Type'] = get_mime(ext)
+    conn.headers['Content-Length'] = str(file_size)
+
+    pprint.pprint(vars(conn))
+
+def handle_request(conn):
+    if conn.method == 'GET':
+        handle_get(conn)
+
+def read_request(conn):
+    data = conn.sockfd.recv(1 << 15)
+
+    print '-' * 20
+    print data
+    print '^' * 20
+
+    return data 
+
+def reply_request(conn):
+    '''assume that conn.reply_fd is valid if conn.state
+       is REPLY_FROM_FILE
+       '''
+    status_line = '%s %d %s\r\n' % (
+        HTTP_PROTOCOL, conn.http_code, conn.http_msg)
+    headers = conn.headers
+    headers = '\r\n'.join((': '.join((key, headers[key])) for key in headers))
+
+    conn.sockfd.send(status_line)
+    conn.sockfd.send(headers)
+    conn.sockfd.send('\r\n\r\n')
+
+    if conn.state == State.REPLY_DIRECT:
+        conn.sockfd.send(conn.reply_html)
+    elif conn.state == State.REPLY_FROM_FILE:
+        while True:
+            data = conn.reply_fd.read(8192)
+            if len(data) == 0: break
+            conn.sockfd.send(data)
+        conn.reply_fd.close()
+
+def handle_connection(conn):
+    try:
+        while True:
+            data = read_request(conn)
+
+            if not data:
+                break
+
+            if parse_http(conn, data) == -1:
+                return -1
+
+            handle_request(conn)
+
+            reply_request(conn)
+    except socket.error:
+        pass
+        # print 'socket ' * 5
+        # traceback.print_exc()
+
+class thread_run(threading.Thread):
+    def __init__(self, conn):
+        threading.Thread.__init__(self)
+        self.conn = conn
+    def run(self):
+        handle_connection(self.conn)
+        self.conn.sockfd.close()
+        print '[', self.getName(), ']', 'ended'
+
+def multithread_run(sock): 
+    while True:
+        clientfd, clientaddr = sock.accept() 
+
+        # timeout for 5 seconds
+        clientfd.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO,
+                            struct.pack('ll', timeout, 0))
+
+        # select, fork or multithread
+        conn = Connection(clientfd, clientaddr[0]) 
+
+        th = thread_run(conn)
+        th.start()
+
+run = multithread_run
+
+if __name__ == '__main__':
+    sock = init()
+    run(sock)
