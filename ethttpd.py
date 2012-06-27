@@ -23,7 +23,7 @@ cgiexts = ['cgi', 'php', 'sh', 'py']
 cgienv = {'SERVER_SOFTWARE': 'ethttpd-py',
           'SERVER_NAME': 'localhost',
           'SERVER_PORT': str(port),
-          'GATEWAY_INTERFACE': 'CGI/1.2',
+          'GATEWAY_INTERFACE': 'CGI/1.1',
           'SERVER_PROTOCOL': 'HTTP/1.1',}
 
 mimes = {"application/ogg":      " ogg",
@@ -100,7 +100,13 @@ def parse_http(conn, req_text):
         reqline = reqlines[0]
         method, uri, protocol = reqline.split() 
         attrs = {}
+        body_index = -1
         for i in range(1, len(reqlines)):
+            if method == 'POST' and len(reqlines[i]) == 0:
+                body_index = i
+                pprint.pprint(reqlines[body_index:])
+                conn.body = '\r\n'.join(reqlines[body_index + 1:])
+                break
             colonindex = reqlines[i].find(':')
             if colonindex == -1:
                 continue
@@ -108,17 +114,13 @@ def parse_http(conn, req_text):
             value = reqlines[i][colonindex + 2:] # strip ": "
             attrs[key] = value 
 
-        # horrible idea
-        # if uri.startswith('/'):
-        #     uri = uri[1:]
-
-        # if uri.endswith('/'):
-        #     # TODO: index.php html py, etc
-        #     uri += 'index.html'
-
         pos = uri.find('?')
         if pos != -1:
-            conn.filename = os.path.normpath(DOCUMENT_ROOT + uri[:pos])
+            u = DOCUMENT_ROOT + uri[:pos]
+            # FIXME
+            if u.endswith('/'):
+                u += 'index.php' 
+            conn.filename = os.path.normpath(u)
             conn.query_string = uri[pos + 1:]
         else:
             u = uri
@@ -158,21 +160,28 @@ def cgi_response_parse(conn, response):
         for line in header.splitlines():
             key, value = line.split(': ')
             headers[key] = value
-        pprint.pprint(headers)
+        #pprint.pprint(headers)
 
         value = headers.get('Status')
         if value:
             conn.http_code = int(value[:3])
+            conn.http_msg = value[4:]
 
         value = headers.get('Connection', '')
         conn.keepalive = True if value.lower() == 'keep-alive' else False 
 
         # aaaaa
-        conn.sockfd.send('HTTP/1.1 %d ET\r\n' % conn.http_code)
+        conn.sockfd.send('HTTP/1.1 %d %s\r\n' % (conn.http_code, conn.http_msg))
 
 def handle_cgi(conn):
     print 'handle_cgi'
-    read_end, write_end = os.pipe()
+    from_cgi_read_end, from_cgi_write_end = os.pipe()
+    try:
+        to_cgi_read_end, to_cgi_write_end = os.pipe()
+    except:
+        os.close(from_cgi_read_end)
+        os.close(from_cgi_write_end)
+
     try:
         pid = os.fork()
     except:
@@ -184,34 +193,66 @@ def handle_cgi(conn):
         cgienv['SCRIPT_NAME'] = os.path.basename(conn.filename)
         cgienv['REMOTE_ADDR'] = conn.remote_ip
         cgienv['DOCUMENT_ROOT'] = DOCUMENT_ROOT
-        #cgienv['QUERY_STRING'] = conn.remote_ip 
-        cgienv['REDIRECT_STATUS'] = '200'
+        cgienv['REDIRECT_STATUS'] = 'CGI'
         cgienv['REQUEST_URI'] = conn.uri
         cgienv['HTTP_HOST'] = conn.attrs['Host']
         cgienv['HTTP_CONNECTION'] = 'keep-alive' if conn.keepalive else 'close'
         if conn.query_string:
             cgienv['QUERY_STRING'] = conn.query_string
+        if conn.attrs.get('Content-Length'):
+            cgienv['CONTENT_LENGTH'] = conn.attrs['Content-Length']
+        if conn.attrs.get('Content-Type'):
+            cgienv['CONTENT_TYPE'] = conn.attrs['Content-Type']
+        if conn.attrs.get('Referer'):
+            cgienv['HTTP_REFERER'] = conn.attrs['Referer']
+        if conn.attrs.get('Cookie'):
+            cgienv['HTTP_COOKIE'] = conn.attrs['Cookie']
 
-        pprint.pprint(cgienv)
+        # pprint.pprint(vars(conn))
+        # pprint.pprint(cgienv)
 
-        os.close(read_end)
-        os.dup2(write_end, sys.stdout.fileno())
-        os.execve('/usr/bin/php5-cgi', ['php5-cgi', conn.uri], cgienv)
+        # move stdout to from_cgi_write_end
+        os.close(sys.stdout.fileno())
+        os.dup2(from_cgi_write_end, sys.stdout.fileno())
+        os.close(from_cgi_write_end)
+        # not needed
+        os.close(from_cgi_read_end)
+
+        # move stdin to to_cgi_read_end
+        os.close(sys.stdin.fileno())
+        os.dup2(to_cgi_read_end, sys.stdin.fileno())
+        os.close(to_cgi_read_end)
+        # not needed
+        os.close(to_cgi_write_end)
+
+        if conn.filename.endswith('.php'):
+            os.execve('/usr/bin/php5-cgi', ['php5-cgi', conn.filename], cgienv)
+        else:
+            os.execve(conn.filename, (conn.filename, ), cgienv)
+
+        os.abort()
     else: # parent
         try:
+            os.close(to_cgi_read_end)
+            os.close(from_cgi_write_end)
+            if conn.method == 'POST':
+               # print 'post ' * 50 
+               # print conn.body
+               # print '#' * 30
+               os.write(to_cgi_write_end, conn.body)
             response = ''
-            os.close(write_end)
             isfirst = True
             while True:
-                data = os.read(read_end, 4096)
-                print '+-' * 20
-                print data
-                print '+=' * 20
+                data = os.read(from_cgi_read_end, 4096)
+                # print '+-' * 20
+                # print data
+                # print '+=' * 20
                 if not data:
                     print 'return not data'
                     break
                 response += data
-            os.close(read_end)
+            os.close(to_cgi_write_end)
+            os.close(from_cgi_read_end)
             print '_+' * 20
         except:
             traceback.print_exc()
@@ -243,6 +284,15 @@ def handle_get(conn):
                           '404 Not Found You Wanted')
         return
 
+    ext = os.path.splitext(conn.filename)[1]
+    ext = ext[1:] if ext.startswith('.') else ext
+    print '[extension]:', ext
+
+    # check cgi
+    if ext in cgiexts:
+        conn.state = State.CGI
+        return
+
     # privilege
     try:
         f = open(conn.filename, 'rb')
@@ -255,14 +305,6 @@ def handle_get(conn):
     file_size = file_status[stat.ST_SIZE]
     modified_date = file_status[stat.ST_MTIME]
 
-    ext = os.path.splitext(conn.filename)[1]
-    ext = ext[1:] if ext.startswith('.') else ext
-
-    # check cgi
-    if ext in cgiexts:
-        conn.state = State.CGI
-        return
-
     # static file
     conn.state = State.REPLY_FROM_FILE
     conn.http_code = 200
@@ -271,11 +313,8 @@ def handle_get(conn):
     conn.headers['Content-Type'] = get_mime(ext)
     conn.headers['Content-Length'] = str(file_size)
 
-    pprint.pprint(vars(conn))
-
 def handle_request(conn):
-    if conn.method == 'GET':
-        handle_get(conn)
+    handle_get(conn)
 
 def read_request(conn):
     data = conn.sockfd.recv(1 << 15)
@@ -332,8 +371,6 @@ def handle_connection(conn):
 
             if parse_http(conn, data) == -1:
                 return -1
-
-            pprint.pprint(vars(conn))
 
             handle_request(conn)
 
