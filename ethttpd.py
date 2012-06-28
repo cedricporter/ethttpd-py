@@ -10,6 +10,7 @@
 import socket, os, threading, sys, signal, stat
 import time, struct, re, traceback
 import pprint, ettools
+from collections import defaultdict
 
 host = ''
 port = 12345
@@ -19,12 +20,6 @@ DOCUMENT_ROOT = os.getcwd() + '/'
 HTTP_PROTOCOL = 'HTTP/1.1'
 
 cgiexts = ['cgi', 'php', 'sh', 'py']
-
-cgienv = {'SERVER_SOFTWARE': 'ethttpd-py',
-          'SERVER_NAME': 'localhost',
-          'SERVER_PORT': str(port),
-          'GATEWAY_INTERFACE': 'CGI/1.1',
-          'SERVER_PROTOCOL': 'HTTP/1.1',}
 
 mimes = {"application/ogg":      " ogg",
          "application/pdf":      " pdf",
@@ -51,6 +46,16 @@ for t in mimes.keys():
         mm[ext] = t
 mimes = mm 
 
+default_files = set([
+    'index.html',
+    'index.php',
+    ])
+
+def handle_php(conn):
+    handle_cgi(conn)
+
+handlers = {}
+
 class Request(object):
     def __init__(self, header):
         self.request = ''
@@ -59,7 +64,7 @@ class Request(object):
         self.http_method = ''
         self.http_version = ''
         self.request_line = ''
-        self.headers = {}
+        self.headers = defaultdict(list)
         self.content_length = -1
         self.body = ''
         self.query_string = ''
@@ -74,17 +79,17 @@ class Request(object):
         self.orig_uri = self.uri = uri
         qpos = uri.find('?')
         if qpos != -1:
-            self.query_string = qpos[qpos + 1:]
-            self.uri = qpos[:qpos]
+            self.query_string = uri[qpos + 1:]
+            self.uri = uri[:qpos]
         
         self.http_method = method
         self.http_version = protocol 
 
         for i in range(1, len(lines)):
             key, value = lines[i].split(': ')
-            self.headers[key] = value
+            self.headers[key].append(value)
 
-        self.content_length = self.headers.get('Content-Length', -1) 
+        self.content_length = self.headers.get('Content-Length', [-1])[0]
 
 class Response(object):
     RESPONSE_FROM_FILE = 0
@@ -93,7 +98,7 @@ class Response(object):
     def __init__(self):
         self.content_length = -1
         self.keepalive = False
-        self.headers = {}
+        self.headers = defaultdict(list)
         self.response_type = Response.RESPONSE_FROM_MEM
         self.response = ''
         self.response_fd = -1 
@@ -102,16 +107,6 @@ class Connection(object):
     def __init__(self, sockfd, remote_ip):
         self.sockfd = sockfd
         self.remote_ip = remote_ip
-        self.uri = ''
-        self.query_string = ''
-        self.filename = ''
-        self.request = None
-        self.state = None
-        self.http_code = -1
-        self.http_msg = ''
-        self.headers = {}
-        self.reply_fd = None
-        self.reply_html = ''
         self.keepalive = False
 
         self.reset()
@@ -166,35 +161,46 @@ def get_mime(ext):
     'Get mime type by extension, ignore case'
     return mimes.get(ext.lower(), 'application/octet-stream')
 
-def php_handle(conn):
-    pass
+def cgi_response_parse(conn, cgi_response):
+    print '=' * 50
+    # print cgi_response
 
-def cgi_response_parse(conn, response):
-    if response.startswith('HTTP/1.'):
-        if (response[7] == '1' or response[7] == '0') and response[8] == ' ':
-            status = response[8:10]
+    if cgi_response.startswith('HTTP/1.'):
+        if (cgi_response[7] == '1' or cgi_response[7] == '0') and cgi_response[8] == ' ':
+            status = cgi_response[8:10]
             status = int(status)
             if 0 <= status < 1000:
                 # good
-                conn.http_code = status
+                conn.http_status = status
     else:
-        header = response[:re.search(r'\r?\n\r?\n', response).start()]
-        headers = {}
+        separtor = re.search(r'\r?\n\r?\n', cgi_response)
+        header = cgi_response[:separtor.start()]
+        headers = defaultdict(list)
         for line in header.splitlines():
             key, value = line.split(': ')
-            headers[key] = value
-        #pprint.pprint(headers)
+            headers[key].append(value)
+
+        print 'cgi_response_parse', '|' * 100
+        pprint.pprint(headers)
 
         value = headers.get('Status')
         if value:
-            conn.http_code = int(value[:3])
+            value = value[0]
+            conn.http_status = int(value[:3])
             conn.http_msg = value[4:]
+            del headers['Status']
 
-        value = headers.get('Connection', '')
+        value = headers.get('Connection', [''])[0]
         conn.keepalive = True if value.lower() == 'keep-alive' else False 
 
-        # aaaaa
-        conn.sockfd.send('HTTP/1.1 %d %s\r\n' % (conn.http_code, conn.http_msg))
+        response = Response()
+        response.response_type = Response.RESPONSE_FROM_MEM
+        response.keepalive = conn.keepalive
+        response.headers = headers
+        response.response = cgi_response[separtor.end():]
+
+        conn.response = response
+
 
 def handle_cgi(conn):
     print 'handle_cgi'
@@ -210,29 +216,41 @@ def handle_cgi(conn):
     except:
         return -1
     if pid == 0: # child
-        cgienv['REQUEST_METHOD'] = conn.method
+        filename = os.path.normpath(DOCUMENT_ROOT + conn.request.uri)
+        print 'CC' * 50
+        print filename
+
+        cgienv = {'SERVER_SOFTWARE': 'ethttpd-py',
+                  'SERVER_NAME': 'localhost',
+                  'SERVER_PORT': str(port),
+                  'GATEWAY_INTERFACE': 'CGI/1.1',
+                  'SERVER_PROTOCOL': 'HTTP/1.1',}
+
+        cgienv['REQUEST_METHOD'] = conn.request.http_method
         # SCRIPT_FILENAME is VERY important.
-        cgienv['SCRIPT_FILENAME'] = conn.filename
-        cgienv['SCRIPT_NAME'] = os.path.basename(conn.filename)
+        cgienv['SCRIPT_FILENAME'] = filename
+        cgienv['SCRIPT_NAME'] = os.path.basename(filename)
         cgienv['REMOTE_ADDR'] = conn.remote_ip
         cgienv['DOCUMENT_ROOT'] = DOCUMENT_ROOT
-        cgienv['REDIRECT_STATUS'] = 'CGI'
-        cgienv['REQUEST_URI'] = conn.uri
-        cgienv['HTTP_HOST'] = conn.attrs['Host']
+        cgienv['REDIRECT_STATUS'] = '200'
+        cgienv['REQUEST_URI'] = conn.request.orig_uri
+        cgienv['HTTP_HOST'] = conn.request.headers['Host'][0]
         cgienv['HTTP_CONNECTION'] = 'Keep-Alive' if conn.keepalive else 'close'
-        if conn.query_string:
-            cgienv['QUERY_STRING'] = conn.query_string
-        if conn.attrs.get('Content-Length'):
-            cgienv['CONTENT_LENGTH'] = conn.attrs['Content-Length']
-        if conn.attrs.get('Content-Type'):
-            cgienv['CONTENT_TYPE'] = conn.attrs['Content-Type']
-        if conn.attrs.get('Referer'):
-            cgienv['HTTP_REFERER'] = conn.attrs['Referer']
-        if conn.attrs.get('Cookie'):
-            cgienv['HTTP_COOKIE'] = conn.attrs['Cookie']
+
+        attrs = conn.request.headers
+        if conn.request.query_string:
+            cgienv['QUERY_STRING'] = conn.request.query_string
+        if attrs.get('Content-Length'):
+            cgienv['CONTENT_LENGTH'] = attrs['Content-Length'][0]
+        if attrs.get('Content-Type'):
+            cgienv['CONTENT_TYPE'] = attrs['Content-Type'][0]
+        if attrs.get('Referer'):
+            cgienv['HTTP_REFERER'] = attrs['Referer'][0]
+        if attrs.get('Cookie'):
+            cgienv['HTTP_COOKIE'] = attrs['Cookie'][0]
 
         # pprint.pprint(vars(conn))
-        # pprint.pprint(cgienv)
+        pprint.pprint(cgienv)
 
         # move stdout to from_cgi_write_end
         os.close(sys.stdout.fileno())
@@ -248,28 +266,28 @@ def handle_cgi(conn):
         # not needed
         os.close(to_cgi_write_end)
 
-        if conn.filename.endswith('.php'):
-            os.execve('/usr/bin/php5-cgi', ['php5-cgi', conn.filename], cgienv)
+        if filename.endswith('.php'):
+            os.execve('/usr/bin/php5-cgi', ['php5-cgi', filename], cgienv)
         else:
-            os.execve(conn.filename, (conn.filename, ), cgienv)
+            os.execve(filename, (filename, ), cgienv)
 
         os.abort()
     else: # parent
         try:
             os.close(to_cgi_read_end)
             os.close(from_cgi_write_end)
-            if conn.method == 'POST':
+            if conn.request.http_method == 'POST':
                # print 'post ' * 50 
                # print conn.body
                # print '#' * 30
-               os.write(to_cgi_write_end, conn.body)
+               os.write(to_cgi_write_end, conn.request.body)
             response = ''
             isfirst = True
             while True:
                 data = os.read(from_cgi_read_end, 4096)
-                # print '+-' * 20
+                # print '+-' * 40
                 # print data
-                # print '+=' * 20
+                # print '+=' * 40
                 if not data:
                     print 'return not data'
                     break
@@ -279,10 +297,10 @@ def handle_cgi(conn):
             print '_+' * 20
         except:
             traceback.print_exc()
+
+        # print '[response]' * 5
+        # print response
         cgi_response_parse(conn, response)
-        if conn.http_code == -1:
-            conn.sockfd.send('HTTP/1.1 200 OK\r\n')
-        conn.sockfd.send(response) 
 
     return 0 
 
@@ -290,56 +308,64 @@ def make_direct_reply(conn, http_status, msg, html):
     response = Response()
     response.response_type = Response.RESPONSE_FROM_MEM
     response.response = html
-    response.headers['Content-Type'] = 'text/html'
-    response.headers['Content-Length'] = str(len(html))
+    response.headers['Content-Type'].append('text/html')
+    response.headers['Content-Length'].append(str(len(html)))
+    response.content_length = len(html)
 
     conn.http_status = http_status
     conn.response = response 
 
 def handle_request(conn):
-    uri = os.path.normpath(DOCUMENT_ROOT + conn.request.uri)
+    filename = os.path.normpath(DOCUMENT_ROOT + conn.request.uri)
 
-    print uri
+    print 'AB' * 50
+    print filename
 
     # check whether the file exists
-    if not os.path.isfile(uri):
+    if not os.path.isfile(filename):
         # try to add normal file to the end of uri
-        for name in ('index.php',):
-            pass
-        make_direct_reply(conn, 404, 'Not Found',
-                          '404 Not Found You Wanted')
-        return
+        for name in default_files:
+            test_name = os.path.join(filename, name)
+            if os.path.isfile(test_name):
+                conn.request.uri = os.path.join(conn.request.uri, name)
+                filename = test_name
+                break
+        else:
+            make_direct_reply(conn, 404, 'Not Found',
+                              '404 Not Found You Wanted')
+            return
+
+    ext = os.path.splitext(filename)[1]
+    ext = ext[1:] if ext.startswith('.') else ext
 
     # check if there's special handler for this file
     # ...... 
-    if 0:
+    if ext in handlers.keys():
+        handlers[ext](conn)
         return
 
     # ok, it's a normal static file
     # privilege
     try:
-        f = open(uri, 'rb')
+        f = open(filename, 'rb')
     except IOError, e:
         make_direct_reply(conn, 403, 'Forbidden',
                           'Permision Denied')
         return
 
-    file_status = os.stat(uri) 
+    file_status = os.stat(filename) 
     file_size = file_status[stat.ST_SIZE]
     modified_date = file_status[stat.ST_MTIME]
 
     # static file
-    conn.http_status = 200
-
-    ext = os.path.splitext(uri)[1]
-    ext = ext[1:] if ext.startswith('.') else ext
+    conn.http_status = 200 
 
     response = Response()
     response.response_type = Response.RESPONSE_FROM_FILE
     response.response_fd = f
     response.content_length = file_size
-    response.headers['Content-Type'] = get_mime(ext)
-    response.headers['Content-Length'] = str(file_size)
+    response.headers['Content-Type'].append(get_mime(ext))
+    response.headers['Content-Length'].append(str(file_size))
 
     conn.response = response
 
@@ -350,28 +376,50 @@ def read_request(conn):
     request = Request(header)
 
     if request.http_method == 'POST':
-        weWant = request.content_length
+        weWant = int(request.content_length)
         weHad = len(data) - header_end_pos
-        body = conn.sockfd.recv(weWant - weHad)
-        body = data[header_end_pos:] + body
+
+        print 'weWant', weWant
+        print 'weHad', weHad
+
+        to_read = weWant - weHad
+
+        body = data[header_end_pos:] 
+        if to_read > 0:
+            print 'fuck' * 411
+            tail = conn.sockfd.recv(to_read)
+            body += tail
+
         request.body = body 
 
     conn.request = request
 
     conn.keepalive = True if \
-        request.headers.get('Connection', '').lower() == 'keep-alive' else False
+        request.headers.get('Connection', [''])[0].lower() == 'keep-alive' else False
 
 def response_request(conn):
     r = conn.response
+    print '[response_request]'
+    # pprint.pprint(vars(r))
+    # pprint.pprint(vars(conn))
 
     status_line = '%s %d %s\r\n' % (
-        HTTP_PROTOCOL, conn.http_status, 'OK')
+        HTTP_PROTOCOL, conn.http_status, 'Fuck')
     headers = r.headers
-    headers = '\r\n'.join((': '.join((key, headers[key])) for key in headers))
+    # headers = '\r\n'.join((': '.join((key, headers[key])) for key in headers))
+
+    header_text = ''
+    for key in headers:
+        for v in headers[key]:
+            header_text += ''.join((key, ': ', v, '\r\n'))
+    header_text += '\r\n'
+
+    print 'X' * 100
+    print header_text
 
     conn.sockfd.send(status_line)
-    conn.sockfd.send(headers)
-    conn.sockfd.send('\r\n\r\n')
+    conn.sockfd.send(header_text)
+    # conn.sockfd.send('\r\n\r\n')
 
     if r.response_type == Response.RESPONSE_FROM_MEM:
         conn.sockfd.send(r.response)
@@ -381,6 +429,7 @@ def response_request(conn):
             if len(data) == 0: break
             conn.sockfd.send(data)
         r.response_fd.close()
+        r.response_fd = -1
 
 def handle_connection(conn):
     try:
@@ -392,8 +441,8 @@ def handle_connection(conn):
             handle_request(conn)
 
             if conn.keepalive:
-                conn.response.headers['Connection'] = 'Keep-Alive' 
-                conn.response.headers['Keep-Alive'] = 'timeout=%d' % (timeout, )
+                conn.response.headers['Connection'].append('Keep-Alive')
+                conn.response.headers['Keep-Alive'].append('timeout=%d' % (timeout, ))
 
             response_request(conn)
 
@@ -406,5 +455,10 @@ def handle_connection(conn):
 
 
 if __name__ == '__main__':
+    handlers = {
+        'php': handle_php,
+        'py': handle_cgi,
+        }
+
     server = MultiThreadServer(host, port)
     server.serve_forver()
